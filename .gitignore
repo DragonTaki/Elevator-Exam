@@ -1,0 +1,118 @@
+## Ignore Visual Studio temporary files, build results, and
+## user-specific files
+
+# Project files and folders
+Temp/
+
+# Build results
+[Bb]in/
+[Bb]uild/
+[Oo]bj/
+[Ll]og/
+*.log
+
+# Uncomment if you have tasks that create the project's static files in wwwroot
+# wwwroot/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Mono Auto Generated Files
+mono_crash.*
+
+# Windows image file caches
+Thumbs.db
+ehthumbs.db
+
+# Folder config file
+Desktop.ini
+
+# VS Code
+.vscode/
+
+# Rider
+.idea/
+
+# ASP.NET Scaffolding
+ScaffoldingReadMe.txt
+
+# DotCover
+*.dotCover
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Visual Studio
+.vs/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Resharper
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# File-based project tools
+*.dbmdl
+*.bak
+
+# T4
+*.tt~
+*.tmp
+
+# Publish files
+*.publish.xml
+
+# Runtime
+*.exe
+*.dll
+*.pdb
+*.obj
+
+# Others
+*.cache
+*.config
+*.vspscc
+*.vssscc
+*.ncb
+*.sbr
+*.scc
+*.class
+*.DS_Store
+*.orig
+*.bak
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+*.testsettings
+*.vsmdi
+*.vsp
+*.vspx
+*.sarif
+
+# Temporary files
+~$*
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# Git directory metadata
+*.orig
+
+# Others
+*.sqlite
