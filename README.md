@@ -19,8 +19,6 @@ This project is only for private use.
 
 ## 📜 Third-Party Licenses
 
-This project uses [**fmt**](https://github.com/fmtlib/fmt), licensed under the [MIT](https://github.com/fmtlib/fmt/blob/master/LICENSE).
-
 - 僅供個人學術研究使用，可相互探討，禁止抄襲（包含部分抄襲）
 - 禁止搬運、複製或儲存於其他儲存庫中
 - 禁止當作作業 Project
