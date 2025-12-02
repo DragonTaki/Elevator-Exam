@@ -1,2 +1,2 @@
-build\main.exe --server
+build\main.exe
 pause
