@@ -30,12 +30,13 @@ static int g_running = 0;
 static PlatformThread* g_core_thread = NULL;
 
 static server_core_status_cb_t g_status_cb = NULL;
-/* set status callback (optional) */
+/* 電梯狀態輸出的輸出介面 */
+// 連接 log、監測畫面等
 void server_core_set_status_callback(server_core_status_cb_t cb) {
     g_status_cb = cb;
 }
 
-/* Initialization */
+/* 初始化電梯系統與事件系統 */
 int server_core_init(int elevator_count)
 {
     if (elevator_count <= 0 || elevator_count > MAX_ELEVATORS) elevator_count = DEFAULT_ELEVATOR_COUNT;
@@ -55,19 +56,19 @@ int server_core_init(int elevator_count)
     return 0; /* success */
 }
 
-/* Shutdown helper */
+/* 關閉事件 */
 void server_core_shutdown(void)
 {
-    // notify server_events to shutdown (wakes consumer)
     server_events_shutdown();
 }
 
-/* Expose pointer to pending requests so tests or init can pre-fill */
+/* 取得 Pending Request 佇列指標 */
 RequestQueue* server_core_get_pending_queue(void) {
     return &g_pending_requests;
 }
 
-/* Process server_events queue into pending/local queues. Non-blocking: try to drain current events. */
+/* 處理一次事件佇列 */
+// server_events 轉換成 elevator/scheduler 事件
 static void process_incoming_events_once(void)
 {
     ServerEvent* ev = NULL;
@@ -133,7 +134,7 @@ static void process_incoming_events_once(void)
     }
 }
 
-/* Build a textual snapshot and call status callback if available; otherwise print to stdout */
+/* 取得所有電梯狀態文字快照 */
 static void publish_state_once(void)
 {
     // build a compact multi-line snapshot into a buffer
@@ -146,16 +147,25 @@ static void publish_state_once(void)
         Elevator_status_line(&g_elevators[i], line, sizeof(line));
         off += snprintf(buf + off, BUF_SZ - off, "%s\n", line);
     }
-    // publish via callback if set, else print
+    // 如果有連接外部 => 丟給外部
     if (g_status_cb) {
         g_status_cb(buf);
-    } else {
-        // default: print to stdout (useful for demo)
+    }
+    // 沒連接就直接印
+    else {
         fputs(buf, stdout);
     }
 }
 
-/* Core loop function (PlatformThreadFn signature) */
+/*
+ * 核心迴圈（執行緒）：
+ * 1. 處理事件
+ * 2. 執行排程器（指派請求）
+ * 3. 更新電梯狀態
+ * 4. 輸出電梯狀態
+ * 5. 睡眠
+ * 直到 g_running = 0 結束
+ */
 static void* core_thread_fn(void* arg)
 {
     (void)arg;
@@ -175,7 +185,7 @@ static void* core_thread_fn(void* arg)
         }
 
         // 4 publish state (could be every N ticks; here every tick)
-        publish_state_once();
+        //publish_state_once();
 
         // 5 sleep dt
         platform_sleep_ms((int)(dt * 1000.0));
@@ -184,7 +194,7 @@ static void* core_thread_fn(void* arg)
     return NULL;
 }
 
-/* Start core loop in a thread (non-blocking). Returns 0 on success. */
+/* 啟動核心迴圈執行緒 */
 int server_core_start(void)
 {
     if (g_core_thread != NULL) return -1; // already running
@@ -193,7 +203,7 @@ int server_core_start(void)
     return 0;
 }
 
-/* Stop core loop and join thread */
+/* 停止核心迴圈 */
 void server_core_stop(void)
 {
     // set running flag to 0 and also trigger server_events shutdown to wake potential blocking calls
@@ -205,7 +215,7 @@ void server_core_stop(void)
     }
 }
 
-/* Blocking join (if needed) */
+/* 阻塞等待核心執行緒結束 */
 void server_core_join(void)
 {
     if (g_core_thread) {
@@ -214,10 +224,12 @@ void server_core_join(void)
     }
 }
 
+/* 回傳電梯陣列指標 */
 Elevator* server_core_get_elevators(void) {
-    return g_elevators; /* pointer to internal array (read-only to caller) */
+    return g_elevators;
 }
 
+/* 回傳目前電梯數量 */
 int server_core_get_elevator_count(void) {
     return g_elevator_count;
 }

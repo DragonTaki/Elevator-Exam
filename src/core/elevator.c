@@ -17,23 +17,22 @@
 
 const double DEFAULT_SPEED_FPS = 1.0 / 1.0;  // 移動 1 層樓 / 每 1 秒
 const double DEFAULT_DOOR_OPEN_S = 1.0;      // 電梯開門時長（秒）
-const double MIN_DOOR_OPEN_S = 0.1;          // safety lower bound
 
-/* accumulators for fractional movement per elevator (time accumulation)
-   static so multiple calls keep progress. Size uses MAX_ELEVATORS. */
+/* 電梯移動時間儲存 */
+/* 0.1s => 0.5s => 直到 1.0s => 減 1 秒 & 移動一層樓 */
 static double g_accum_time[MAX_ELEVATORS] = {0.0};
 
 /* ---------------------------
    Flag-based helpers
    --------------------------- */
 
-/* returns 1 if any request exists (inside or external) on floor */
+/* 判斷指定樓層是否有任何請求(內/外呼) */
 static inline int has_request_on_floor(const Elevator* e, int floor) {
     if (!e || floor < 0 || floor >= MAX_FLOORS) return 0;
     return (e->inside[floor] || e->call_up[floor] || e->call_down[floor]) ? 1 : 0;
 }
 
-/* returns nonzero if elevator has any stops at all */
+/* 判斷電梯是否仍有任務 */
 int elevator_has_stops(const Elevator* e) {
     if (!e) return 0;
     for (int f = 0; f < MAX_FLOORS; ++f) {
@@ -42,65 +41,18 @@ int elevator_has_stops(const Elevator* e) {
     return 0;
 }
 
-/* returns nonzero if there are any stops in the given direction relative to current floor */
-static int has_stops_in_direction_flag(const Elevator* e, Direction dir) {
-    if (!e) return ELEV_ERR_INVALID;
-    int cur = e->current_floor;
-    if (dir == DIR_UP) {
-        for (int f = cur + 1; f < MAX_FLOORS; ++f)
-            if (has_request_on_floor(e, f)) return ELEV_OK;
-        return ELEV_ERR_INVALID;
-    } else if (dir == DIR_DOWN) {
-        for (int f = cur - 1; f >= 0; --f)
-            if (has_request_on_floor(e, f)) return ELEV_OK;
-        return ELEV_ERR_INVALID;
-    } else {
-        return elevator_has_stops(e);
-    }
-}
-
-/* pick direction when idle: prefer up if any up, else down, else none.
- * This preserves previous simple behavior.
- */
-static Direction pick_direction_when_idle_flag(Elevator* e) {
-    if (!e) return DIR_NONE;
-    int cur = e->current_floor;
-    /* prefer any request above */
-    for (int f = cur + 1; f < MAX_FLOORS; ++f)
-        if (has_request_on_floor(e, f)) return DIR_UP;
-    for (int f = cur - 1; f >= 0; --f)
-        if (has_request_on_floor(e, f)) return DIR_DOWN;
-    return DIR_NONE;
-}
-
-/* remove served requests upon arrival at `floor`:
- * - always clear inside[floor]
- * - clear external requests that match the arrival direction:
- *   - if arrival_dir == DIR_UP: clear call_up[floor]
- *   - if arrival_dir == DIR_DOWN: clear call_down[floor]
- * - if arrival_dir == DIR_NONE (idle stop), clear both externals
- */
+/* 電梯抵達樓層後，清除內呼請求*/
 static void remove_served_flags_on_arrival(Elevator* e, int floor, Direction arrival_dir) {
     if (!e || floor < 0 || floor >= MAX_FLOORS) return;
 
-    /* always remove inside requests for this floor */
+    // 永遠清掉這一層的內呼，代表有人在這層下電梯
     e->inside[floor] = false;
-
-    if (arrival_dir == DIR_UP) {
-        e->call_up[floor] = false;
-    } else if (arrival_dir == DIR_DOWN) {
-        e->call_down[floor] = false;
-    } else {
-        /* idle -> remove both sides (policy) */
-        e->call_up[floor] = false;
-        e->call_down[floor] = false;
-    }
 
     printf("[ELEV_DEBUG] E%d remove_served_at_floor -> up=%d down=%d inside=%d (floor=%d)\n",
            e->id, e->call_up[floor], e->call_down[floor], e->inside[floor], floor);
 }
 
-/* 加入電梯排程 */
+/* 加入內/外呼請求 */
 // return -1：錯誤
 // return 0：正常結束
 // return 1：重複請求
@@ -129,27 +81,28 @@ int elevator_add_request_flag(Elevator *e, int floor, RequestType type) {
     }
 }
 
-/* 內呼 => 直接加進該電梯排程 */
+/* 內呼 => 直接加進該電梯樓層請求 */
 int Elevator_push_inside_request(Elevator* e, int dest_floor, int client_id) {
-    (void)client_id; /* we don't store client_id in flag-based model */
+    (void)client_id;
     return elevator_add_request_flag(e, dest_floor, REQ_INSIDE);
 }
 
-/* pick_next_target_flag: locate next target according to SCAN-like policy.
- * If found returns 1 and sets e->target_floor (and maybe changes direction);
- * else returns 0 (no request).
- */
+/* 選取下一個目標樓層 */
+/* 如果同向已無目標，則反轉電梯方向 */
 PickResult pick_next_target_flag(Elevator* e) {
     if (!e) return PICK_ERROR;
     int cur = e->current_floor;
 
+    // 如果電梯向上
     if (e->direction == DIR_UP) {
+        // 先找同向（向上）
         for (int f = cur + 1; f < MAX_FLOORS; ++f) {
             if (has_request_on_floor(e, f)) {
                 e->target_floor = f;
                 return PICK_TARGET_SET;
             }
         }
+        // 沒目標了 => 找反向（向下）
         for (int f = cur - 1; f >= 0; --f) {
             if (has_request_on_floor(e, f)) {
                 e->direction = DIR_DOWN;
@@ -157,13 +110,17 @@ PickResult pick_next_target_flag(Elevator* e) {
                 return PICK_TARGET_SET;
             }
         }
-    } else if (e->direction == DIR_DOWN) {
+    }
+    // 如果電梯向下
+    else if (e->direction == DIR_DOWN) {
+        // 先找同向（向下）
         for (int f = cur - 1; f >= 0; --f) {
             if (has_request_on_floor(e, f)) {
                 e->target_floor = f;
                 return PICK_TARGET_SET;
             }
         }
+        // 沒目標了 => 找反向（向上）
         for (int f = cur + 1; f < MAX_FLOORS; ++f) {
             if (has_request_on_floor(e, f)) {
                 e->direction = DIR_UP;
@@ -171,8 +128,10 @@ PickResult pick_next_target_flag(Elevator* e) {
                 return PICK_TARGET_SET;
             }
         }
-    } else {
-        /* idle: skip current floor (offset starts at 1) */
+    }
+    // 如果電梯閒置
+    else {
+        // 同時往上下找最近的
         for (int offset = 1; offset < MAX_FLOORS; ++offset) {
             int up = cur + offset;
             int down = cur - offset;
@@ -222,6 +181,26 @@ void Elevator_step(Elevator* e, double dt_seconds) {
         e->id, dt_seconds, e->task_state, e->current_floor, e->target_floor,
         e->direction, e->door_open, e->door_timer_s, e->stops.up_count, e->stops.down_count);*/
     if (dt_seconds <= 0.0) return;
+
+    /*
+        狀態機狀態
+
+        TASK_IDLE
+            ↓
+        TASK_PREPARE
+            ↓
+        TASK_MOVING
+            ↓
+        TASK_ARRIVED
+            ↓
+        TASK_DOOR_OPENING
+            ↓
+        TASK_DOOR_OPEN
+            ↓
+        TASK_DOOR_CLOSING
+            ↓
+        TASK_PREPARE 或 TASK_IDLE
+    */
 
     switch (e->task_state) {
     case TASK_DOOR_OPENING:  // 當前狀態：正在開門
@@ -278,9 +257,9 @@ void Elevator_step(Elevator* e, double dt_seconds) {
     case TASK_PREPARE:  // 當前狀態：準備移動
         /*printf("[ELEV_STATUS] E%d STATE: PREPARE (TASK_PREPARE) - cur=%d target=%d\n",
                e->id, e->current_floor, e->target_floor);*/
-        // 若直接收到相同樓層排程 => 立即開門
+        // 若直接收到相同樓層請求 => 立即開門
         if (e->target_floor == e->current_floor) {
-            // 直接當作已抵達 => 開門 & 移除排程
+            // 直接當作已抵達 => 開門 & 移除請求
             e->task_state = TASK_DOOR_OPENING;
             remove_served_flags_on_arrival(e, e->current_floor, e->direction);
             return;
@@ -308,12 +287,30 @@ void Elevator_step(Elevator* e, double dt_seconds) {
             while (g_accum_time[e->id] >= time_per_floor) {
                 g_accum_time[e->id] -= time_per_floor;
 
+                int from_floor = e->current_floor;
+
                 if (e->current_floor < e->target_floor) {
                     e->current_floor++;
                     printf("[ELEV_STEP] E%d moved up: %d -> %d\n", e->id, e->current_floor - 1, e->current_floor);
+
+                    // 往上離開 from_floor，視為已服務該層的「往上」乘客
+                    if (from_floor >= 0 && from_floor < MAX_FLOORS) {
+                        if (e->call_up[from_floor]) {
+                            e->call_up[from_floor] = false;
+                            printf("[ELEV_DEBUG] E%d cleared call_up at floor %d when moving up\n", e->id, from_floor);
+                        }
+                    }
                 } else if (e->current_floor > e->target_floor) {
                     e->current_floor--;
                     printf("[ELEV_STEP] E%d moved down: %d -> %d\n", e->id, e->current_floor + 1, e->current_floor);
+
+                    // 往下離開 from_floor，視為已服務該層的「往下」乘客
+                    if (from_floor >= 0 && from_floor < MAX_FLOORS) {
+                        if (e->call_down[from_floor]) {
+                            e->call_down[from_floor] = false;
+                            printf("[ELEV_DEBUG] E%d cleared call_down at floor %d when moving down\n", e->id, from_floor);
+                        }
+                    }
                 }
 
                 // 到達目標 => break 掉 while & 準備開門
@@ -339,12 +336,12 @@ void Elevator_step(Elevator* e, double dt_seconds) {
         }
         return;
 
-    case TASK_ARRIVED:  // 當前狀態：抵達目標樓層 => 開門 & 移除排程
+    case TASK_ARRIVED:  // 當前狀態：抵達目標樓層 => 開門 & 移除請求
         printf("[ELEV_STATUS] E%d STATE: ARRIVED (TASK_ARRIVED) - floor=%d, opening door and removing stops\n",
                e->id, e->current_floor);
         e->task_state = TASK_DOOR_OPENING;
         e->door_timer_s = DEFAULT_DOOR_OPEN_S;
-        // 移除排程
+        // 移除請求
         remove_served_flags_on_arrival(e, e->current_floor, e->direction);
         return;
 
@@ -352,7 +349,7 @@ void Elevator_step(Elevator* e, double dt_seconds) {
     default:
         /*printf("[ELEV_STATUS] E%d STATE: IDLE (TASK_IDLE) - up_count=%d down_count=%d\n",
                e->id, e->stops.up_count, e->stops.down_count);*/
-        // 如果有排程 => 選方向 & 進準備狀態
+        // 如果有請求 => 選方向 & 進準備狀態
         if (pick_next_target_flag(e)) {
             /* ensure direction consistent */
             if (e->target_floor > e->current_floor)
@@ -371,7 +368,7 @@ void Elevator_step(Elevator* e, double dt_seconds) {
     } /* end switch */
 }
 
-/* status line */
+/* 回傳電梯狀態文字(顯示用) */
 const char* Elevator_status_line(Elevator* e, char* out, int out_size) {
     if (!e || !out || out_size <= 0) return NULL;
     const char* dstr = (e->direction == DIR_UP) ? "UP" : (e->direction == DIR_DOWN) ? "DOWN" : "NONE";

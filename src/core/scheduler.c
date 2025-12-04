@@ -20,6 +20,7 @@ static int sign_int(int x) {
     return (x > 0) ? 1 : ((x < 0) ? -1 : 0);
 }
 
+/* 計算電梯目前所有待處理請求數（內部 + 上 + 下）*/
 static int count_requests(const Elevator* e) {
     if (!e) return 0;
     int count = 0;
@@ -31,14 +32,7 @@ static int count_requests(const Elevator* e) {
     return count;
 }
 
-/* Estimate cost: distance + penalties/bonuses.
- * Bonuses:
- *  - idle elevators: -2.0
- *  - elevator moving towards pickup and pickup is along its path: -1.5
- * Penalties:
- *  - door open: +2.0 (slower to respond)
- *  - high local queue load: +(qload*3.0)
- */
+/* 估算電梯載客的成本 */
 static double estimate_cost(const Elevator* e, int pickup_floor)
 {
     if (!e) return 1e12;
@@ -69,37 +63,79 @@ static double estimate_cost(const Elevator* e, int pickup_floor)
     return cost;
 }
 
-/* try_assign_one:
- * - pop one PendingRequest from pending queue (rq_pop returns 0 on success)
- * - choose best elevator via estimate_cost
- * - assign using elevator_add_request_flag (flag-based API)
- * - if assignment fails (error), push back to pending and return 0
- * - if no elevator available, push back and return 0
- * - returns 1 if assigned successfully
+/*
+ * 從 pending queue 取一個請求，選擇最適合的電梯分配
+ * A) 先選擇最靠近的閒置電梯
+ * B) 否則依成本評估選最佳電梯
+ * 分配失敗則將請求放回佇列
  */
 static int try_assign_one(RequestQueue* pending, Elevator elevators[], int elevator_count)
 {
     PendingRequest preq;
-    if (rq_pop(pending, &preq) != 0) return 0; /* nothing to pop */
+    if (rq_pop(pending, &preq) != 0) return 0;
+
+    int pickup_floor = preq.floor;
+
+    // 如果有閒置，先選最近的閒置電梯
+    int idle_idx = -1;
+    int idle_best_dist = INT_MAX;
+    for (int i = 0; i < elevator_count; ++i) {
+        Elevator* e = &elevators[i];
+        if (!e) continue;
+        if (e->task_state == TASK_IDLE) {
+            int dist = abs(e->current_floor - pickup_floor);
+            // 計算閒置電梯的距離，挑近的
+            if (dist < idle_best_dist) {
+                idle_best_dist = dist;
+                idle_idx = i;
+            } else if (dist == idle_best_dist) {
+                // 距離相同選擇請求較少的電梯
+                int cur_load = 0;
+                for (int f = 0; f < MAX_FLOORS; ++f) {
+                    cur_load += (e->inside[f] || e->call_up[f] || e->call_down[f]);
+                }
+                Elevator* prev = &elevators[idle_idx];
+                int prev_load = 0;
+                for (int f = 0; f < MAX_FLOORS; ++f) {
+                    prev_load += (prev->inside[f] || prev->call_up[f] || prev->call_down[f]);
+                }
+                if (cur_load < prev_load) idle_idx = i;
+            }
+        }
+    }
 
     int best_idx = -1;
     double best_cost = 1e18;
 
-    for (int i = 0; i < elevator_count; ++i) {
-        Elevator* e = &elevators[i];
-        /* skip if elevator flagged full (optional: use count_requests limit) */
-        int cur_load = count_requests(e);
-        if (cur_load >= MAX_REQUESTS) continue;
+    // 如果挑到閒置 => 指派過去
+    if (idle_idx >= 0) {
+        /* Assign to the chosen idle elevator */
+        best_idx = idle_idx;
+        best_cost = 0.0;
+        printf("[SCHED] try_assign_one: picked idle elevator %d for request floor=%d type=%d\n",
+               best_idx, pickup_floor, (int)preq.type);
+    }
+    // 沒閒置的 => 去算載客成本
+    else {
+        for (int i = 0; i < elevator_count; ++i) {
+            Elevator* e = &elevators[i];
+            int cur_load = count_requests(e);
+            if (cur_load >= MAX_REQUESTS) continue;
 
-        double c = estimate_cost(e, preq.floor);
-        if (c < best_cost) {
-            best_cost = c;
-            best_idx = i;
+            double c = estimate_cost(e, preq.floor);
+            if (c < best_cost) {
+                best_cost = c;
+                best_idx = i;
+            }
+        }
+        if (best_idx >= 0) {
+            printf("[SCHED] try_assign_one: picked elevator %d for request floor=%d type=%d (cost=%.2f)\n",
+                   best_idx, pickup_floor, (int)preq.type, best_cost);
         }
     }
 
+    // 沒可用電梯 => 將請求丟回佇列等待下次分配
     if (best_idx < 0) {
-        /* no elevator available now -> push back request */
         rq_push(pending, preq);
         return 0;
     }
@@ -109,27 +145,23 @@ static int try_assign_one(RequestQueue* pending, Elevator elevators[], int eleva
     printf("[SCHED] try_assign_one: picked elevator %d for request floor=%d type=%d (cost=%.2f)\n",
            best_idx, preq.floor, (int)preq.type, best_cost);
 
-    /* perform assignment via flag API */
     int rc = ELEV_ERR_INTERNAL;
     if (preq.type == REQ_INSIDE) {
-        rc = elevator_add_request_flag(chosen, preq.floor, REQ_INSIDE);
-    } else if (preq.type == REQ_CALL_UP) {
-        rc = elevator_add_request_flag(chosen, preq.floor, REQ_CALL_UP);
-    } else if (preq.type == REQ_CALL_DOWN) {
-        rc = elevator_add_request_flag(chosen, preq.floor, REQ_CALL_DOWN);
+        // 內部請求 => 直接記錄到相應的電梯
+        // 正常不會跑到這（防止意外）
+        rc = Elevator_push_inside_request(chosen, preq.to_floor, preq.source_id);
     } else {
-        /* unknown type: push back and bail */
-        rq_push(pending, preq);
-        return 0;
+        // 外部請求 => 進入請求佇列嘗試分配
+        rc = elevator_add_request_flag(chosen, preq.floor, preq.type);
     }
 
     if (rc == ELEV_OK || rc == ELEV_DUPLICATE) {
-        /* success or duplicate (duplicate treated as assigned) */
+        // 成功指派請求
         printf("[SCHED] try_assign_one: elevator_add_request_flag SUCCEEDED for E%d floor=%d (rc=%d)\n",
                chosen->id, preq.floor, rc);
         return 1;
     } else {
-        /* fatal error -> push back and log */
+        // 錯誤
         printf("[SCHED] try_assign_one: elevator_add_request_flag FAILED for E%d floor=%d (rc=%d) -> pushed back\n",
                chosen->id, preq.floor, rc);
         rq_push(pending, preq);
@@ -137,6 +169,7 @@ static int try_assign_one(RequestQueue* pending, Elevator elevators[], int eleva
     }
 }
 
+/* 電梯排程器 */
 void Scheduler_Process(Elevator elevators[], int elevator_count, RequestQueue* pending)
 {
     if (!pending || !elevators) return;

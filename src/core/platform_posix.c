@@ -12,10 +12,14 @@
 #include "platform.h"
 #include <pthread.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
-// Mutex
+// =====================
+// Mutex API
+// =====================
+
 struct PlatformMutex {
     pthread_mutex_t m;
 };
@@ -39,7 +43,10 @@ void platform_mutex_unlock(PlatformMutex* x){
     pthread_mutex_unlock(&x->m);
 }
 
-// CondVar
+// =====================
+// Condition Variable API
+// =====================
+
 struct PlatformCond {
     pthread_cond_t c;
 };
@@ -67,7 +74,10 @@ void platform_cond_broadcast(PlatformCond* c){
     pthread_cond_broadcast(&c->c);
 }
 
-// Threads
+// =====================
+// Thread API
+// =====================
+
 struct PlatformThread {
     pthread_t th;
 };
@@ -83,7 +93,10 @@ void platform_thread_join(PlatformThread* t){
     free(t);
 }
 
+// =====================
 // Time / Sleep
+// =====================
+
 void platform_sleep_ms(int ms){
     usleep(ms * 1000);
 }
@@ -93,6 +106,37 @@ long long platform_time_ms(void){
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000LL +
            (long long)ts.tv_nsec / 1000000LL;
+}
+
+// =====================
+// String
+// =====================
+
+int platform_stricmp(const char* s1, const char* s2) {
+    return strcasecmp(s1, s2);
+}
+
+// =====================
+// Socket
+// =====================
+
+int platform_socket_init(void) {
+    // POSIX 不需要特別初始化
+    return 0;
+}
+
+void platform_socket_cleanup(void) {
+    // POSIX 不需要特別清理
+}
+
+void platform_socket_close(platform_socket_t s) {
+    if (s >= 0) {
+        close(s);
+    }
+}
+
+int platform_socket_last_error(void) {
+    return errno;
 }
 
 #endif

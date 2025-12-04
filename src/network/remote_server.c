@@ -15,22 +15,25 @@
 #include <ws2tcpip.h>
 
 #include "../core/elevator.h"
+#include "../core/server_core.h"
+#include "../core/server_events.h"
 #include "../core/status.h"
-#include "../core/tick.h"
 #include "protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define SIM_TICK_MS 300
-#define LISTEN_BACKLOG 16
+#define SIM_TICK_MS 300    // 多久跑一次
+#define LISTEN_BACKLOG 16  // 等待連線數量上限
 #define MAX_LINE_LEN 512
 
+/* 用戶端種類 */
 typedef enum {
     CLIENT_UNKNOWN = 0,
     CLIENT_BUTTON,
     CLIENT_GUARD
 } ClientType;
 
+/* 用戶端資料 */
 typedef struct {
     SOCKET sock;
     ClientType type;
@@ -43,11 +46,11 @@ typedef struct {
 
 static ClientInfo clients[MAX_CLIENTS];
 static int client_count = 0;
-static RequestQueue reqq;
-/* 新增：每台電梯被 assign 但尚未處理的 drop floor（-1 表示無） */
-int g_assigned_drop[MAX_ELEVATORS];
 
-/* small helper to send a CRLF-terminated line */
+static Elevator* g_elevators = NULL;
+static int g_elevator_count = 0;
+
+/* 發送字串 */
 static void send_line(SOCKET s, const char* line) {
     if (s == INVALID_SOCKET) return;
     char buf[MAX_LINE_LEN];
@@ -55,7 +58,7 @@ static void send_line(SOCKET s, const char* line) {
     send(s, buf, n, 0);
 }
 
-/* broadcast status to guards (only watchers if only_watchers=1) */
+/* 將所有電梯狀態發送給所有警衛端 */
 void broadcast_status_to_guards(Elevator elevators[], int elevator_count, int only_watchers) {
     char line[128];
     char big[2048];
@@ -73,10 +76,13 @@ void broadcast_status_to_guards(Elevator elevators[], int elevator_count, int on
     }
 }
 
+/* 接受新用戶端連線 */
 static void accept_new_client(SOCKET listen_sock) {
     struct sockaddr_in addr;
     int addrlen = sizeof(addr);
     SOCKET c = accept(listen_sock, (struct sockaddr*)&addr, &addrlen);
+
+    // 如果無效或失敗 => 顯示錯誤並跳出
     if (c == INVALID_SOCKET) {
         printf("[SERVER] accept failed: %d\n", WSAGetLastError());
         return;
@@ -86,6 +92,8 @@ static void accept_new_client(SOCKET listen_sock) {
         closesocket(c);
         return;
     }
+
+    // 成功 => 加入至 clients 陣列尾端
     clients[client_count].sock = c;
     clients[client_count].type = CLIENT_UNKNOWN;
     clients[client_count].floor = -1;
@@ -98,29 +106,35 @@ static void accept_new_client(SOCKET listen_sock) {
     send_line(c, "Please declare role: ROLE GUARD  OR  ROLE BUTTON <floor>");
 }
 
+/* 移除已離線或失效的用戶端 */
 static void remove_client(int idx) {
     if (idx < 0 || idx >= client_count) return;
     closesocket(clients[idx].sock);
     printf("[SERVER] Client %d disconnected\n", clients[idx].id);
+
+    // 移動 clients 陣列（後面往前補）
     for (int j = idx; j + 1 < client_count; ++j) clients[j] = clients[j+1];
     client_count--;
 }
-/* parse and handle a single textual command line from client idx */
-static void handle_client_command(int idx, const char* line, Elevator elevators[], int elevator_count) {
+
+/* 剖析並處理用戶端文字指令 */
+static void handle_client_command(int idx, const char* line) {
     ClientInfo* c = &clients[idx];
-    char cmd[64];
+    char cmd[64];  // 指令的第一個 token
     if (sscanf(line, "%63s", cmd) != 1) return;
 
+    // 未知身分
     if (c->type == CLIENT_UNKNOWN) {
-        if (_stricmp(cmd, "ROLE") == 0) {
+        // 先看是不是指定 ROLE
+        if (platform_stricmp(cmd, "ROLE") == 0) {
             char role[64];
             if (sscanf(line, "ROLE %63s", role) == 1) {
-                if (_stricmp(role, "GUARD") == 0) {
+                if (platform_stricmp(role, "GUARD") == 0) {
                     c->type = CLIENT_GUARD;
                     c->watching = 0;
                     send_line(c->sock, "ROLE_OK GUARD");
                     printf("[SERVER] Client %d set ROLE GUARD\n", c->id);
-                } else if (_stricmp(role, "BUTTON") == 0) {
+                } else if (platform_stricmp(role, "BUTTON") == 0) {
                     int floor = -1;
                     if (sscanf(line, "ROLE BUTTON %d", &floor) >= 1) {
                         c->type = CLIENT_BUTTON;
@@ -139,39 +153,33 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
             return;
         }
 
-        /* If client is unknown but sends CALL -> treat as BUTTON CALL */
-        if (_stricmp(cmd, "CALL") == 0 || _stricmp(cmd, "INSIDE") == 0) {
-            /* fall through to common handling below (as if CLIENT_BUTTON) */
-            /* mark as BUTTON for future messages (optional) */
+        // 未知身分 & 沒指定 ROLE => 當作按鈕 & 讀入 CALL 或 INSIDE
+        if (platform_stricmp(cmd, "CALL") == 0 || platform_stricmp(cmd, "INSIDE") == 0) {
             c->type = CLIENT_BUTTON;
-            /* do NOT return here; let processing continue to BUTTON branch */
-        } else {
-            /* other commands are not allowed until role declared */
+        }
+        // 未知身分 & 沒指定 ROLE & 未知指令 => 提示輸入
+        else {
             send_line(c->sock, "Please declare role: ROLE GUARD  OR  ROLE BUTTON <floor>");
             return;
         }
     }
 
-    /* Known client */
+    // 已知身分
     if (c->type == CLIENT_BUTTON) {
-        if (_stricmp(cmd, "CALL") == 0) {
+        // CALL => 外部呼叫（電梯上／下樓按鈕）
+        if (platform_stricmp(cmd, "CALL") == 0) {
             int from, to;
             char dirstr[16] = {0};
 
-            /* numeric form: CALL <from> <to>  (we translate to PendingRequest with to_floor hint) */
+            // CALL <from> <to>
             if (sscanf(line, "CALL %d %d", &from, &to) == 2) {
                 if (from < 0 || from >= MAX_FLOORS || to < 0 || to >= MAX_FLOORS) {
                     send_line(c->sock, "CALL_BAD floor out of range");
                 } else if (from == to) {
                     send_line(c->sock, "CALL_BAD from==to");
                 } else {
-                    PendingRequest p;
-                    p.floor = from;
-                    p.to_floor = to; /* hint for scheduler/assigned drop */
-                    p.source_id = c->id;
-                    p.type = (to > from) ? REQ_CALL_UP : REQ_CALL_DOWN;
-
-                    if (rq_push(&reqq, p) == 0) {
+                    int dir = (to > from) ? DIR_UP : DIR_DOWN;
+                    if (server_events_push_outside(from, dir, c->id) == 0) {
                         send_line(c->sock, "CALL_OK");
                         printf("[SERVER] Request queued from client %d: %d -> %d\n", c->id, from, to);
                     } else {
@@ -179,23 +187,20 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
                     }
                 }
             }
-            /* try directional form: CALL <from> UP/DOWN */
+            // CALL <哪層樓按的> UP/DOWN
             else if (sscanf(line, "CALL %d %15s", &from, dirstr) == 2) {
                 if (from < 0 || from >= MAX_FLOORS) {
                     send_line(c->sock, "CALL_BAD floor out of range");
                     return;
                 }
-                PendingRequest p;
-                p.floor = from;
-                p.to_floor = -1;
-                p.source_id = c->id;
-                if (_stricmp(dirstr, "UP") == 0) p.type = REQ_CALL_UP;
-                else if (_stricmp(dirstr, "DOWN") == 0) p.type = REQ_CALL_DOWN;
+                int dir;
+                if (platform_stricmp(dirstr, "UP") == 0) dir = DIR_UP;
+                else if (platform_stricmp(dirstr, "DOWN") == 0) dir = DIR_DOWN;
                 else {
-                    send_line(c->sock, "CALL_BAD usage: CALL <from> <to>|UP|DOWN");
+                    send_line(c->sock, "CALL_BAD usage: CALL <from> UP|DOWN");
                     return;
                 }
-                if (rq_push(&reqq, p) == 0) {
+                if (server_events_push_outside(from, dir, c->id) == 0) {
                     send_line(c->sock, "CALL_OK");
                     printf("[SERVER] Directional CALL queued from client %d: %d %s\n",
                         c->id, from, dirstr);
@@ -203,14 +208,17 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
                     send_line(c->sock, "CALL_REJECT queue_full");
                 }
             } else {
-                send_line(c->sock, "CALL_BAD usage: CALL <from> <to>  or  CALL <from> UP|DOWN");
+                send_line(c->sock, "CALL_BAD usage: CALL <from> UP|DOWN");
             }
-        } else if (_stricmp(cmd, "INSIDE") == 0) {
+        }
+        // INSIDE => 內部呼叫（電梯內部按樓層）
+        else if (platform_stricmp(cmd, "INSIDE") == 0) {
             int eid, dest;
+            // INSIDE <電梯 ID> <樓層>
             if (sscanf(line, "INSIDE %d %d", &eid, &dest) == 2) {
                 /* validate elevator id */
-                if (eid >= 0 && eid < elevator_count) {
-                    int rc = Elevator_push_inside_request(&elevators[eid], dest, c->id /*client*/);
+                if (eid >= 0) {
+                    int rc = server_events_push_inside(eid, dest, c->id);
                     if (rc == ELEV_OK) {
                         send_line(c->sock, "INSIDE_OK");
                     } else if (rc == ELEV_DUPLICATE) {
@@ -227,32 +235,30 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
         } else {
             send_line(c->sock, "UNKNOWN_CMD (BUTTON allowed: CALL, INSIDE)");
         }
-    } else if (c->type == CLIENT_GUARD) {
-        if (_stricmp(cmd, "STATUS") == 0) {
+    }
+    // 已知身分（警衛）
+    else if (c->type == CLIENT_GUARD) {
+        if (platform_stricmp(cmd, "STATUS") == 0) {
             char buf[256];
-            for (int i = 0; i < elevator_count; ++i) {
-                Elevator_status_line(&elevators[i], buf, sizeof(buf));
+            for (int i = 0; i < g_elevator_count; ++i) {
+                Elevator_status_line(&g_elevators[i], buf, sizeof(buf));
                 send_line(c->sock, buf);
             }
-        } else if (_stricmp(cmd, "WATCH") == 0) {
+        } else if (platform_stricmp(cmd, "WATCH") == 0) {
             c->watching = 1;
             send_line(c->sock, "WATCH_OK");
-        } else if (_stricmp(cmd, "UNWATCH") == 0) {
+        } else if (platform_stricmp(cmd, "UNWATCH") == 0) {
             c->watching = 0;
             send_line(c->sock, "UNWATCH_OK");
-        } else if (_stricmp(cmd, "CALL") == 0) {
+        } else if (platform_stricmp(cmd, "CALL") == 0) {
             int from, to;
             char dirstr[16] = {0};
             if (sscanf(line, "CALL %d %d", &from, &to) == 2) {
                 if (from < 0 || from >= MAX_FLOORS || to < 0 || to >= MAX_FLOORS || from == to) {
                     send_line(c->sock, "CALL_BAD");
                 } else {
-                    PendingRequest p;
-                    p.floor = from;
-                    p.to_floor = to;
-                    p.source_id = c->id;
-                    p.type = (to > from) ? REQ_CALL_UP : REQ_CALL_DOWN;
-                    if (rq_push(&reqq, p) == 0) {
+                    int dir = (to > from) ? DIR_UP : DIR_DOWN;
+                    if (server_events_push_outside(from, dir, c->id) == 0) {
                         send_line(c->sock, "CALL_OK");
                         printf("[SERVER] Guard client %d queued CALL %d->%d\n", c->id, from, to);
                     } else {
@@ -261,15 +267,12 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
                 }
             } else if (sscanf(line, "CALL %d %15s", &from, dirstr) == 2) {
                 if (from < 0 || from >= MAX_FLOORS) { send_line(c->sock, "CALL_BAD"); return; }
-                PendingRequest p;
-                p.floor = from;
-                p.to_floor = -1;
-                p.source_id = c->id;
-                if (_stricmp(dirstr, "UP") == 0) p.type = REQ_CALL_UP;
-                else if (_stricmp(dirstr, "DOWN") == 0) p.type = REQ_CALL_DOWN;
-                else { send_line(c->sock, "CALL_BAD usage: CALL <from> <to>|UP|DOWN"); return; }
+                int dir;
+                if (platform_stricmp(dirstr, "UP") == 0) dir = DIR_UP;
+                else if (platform_stricmp(dirstr, "DOWN") == 0) dir = DIR_DOWN;
+                else { send_line(c->sock, "CALL_BAD usage: CALL <from> UP|DOWN"); return; }
 
-                if (rq_push(&reqq, p) == 0) {
+                if (server_events_push_outside(from, dir, c->id) == 0) {
                     send_line(c->sock, "CALL_OK");
                     printf("[SERVER] Guard directional CALL queued %d %s\n", from, dirstr);
                 } else {
@@ -284,31 +287,30 @@ static void handle_client_command(int idx, const char* line, Elevator elevators[
     }
 }
 
-/* Public function */
-void run_remote_server(Elevator elevators[], int elevator_count, int port) {
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        printf("[SERVER] WSAStartup failed: %d\n", WSAGetLastError());
+/* 伺服器主進入點 */
+void run_remote_server(int port) {
+    g_elevators = server_core_get_elevators();
+    g_elevator_count = server_core_get_elevator_count();
+
+    if (platform_socket_init() != 0) {
+        printf("[SERVER] platform_socket_init failed: %d\n", platform_socket_last_error());
         return;
     }
 
-    rq_init(&reqq);
-    /* 初始化 assigned drop table */
-    for (int i = 0; i < MAX_ELEVATORS; ++i) g_assigned_drop[i] = -1;
-    remote_tick_init(elevators, elevator_count, &reqq, SIM_TICK_MS, g_assigned_drop);
-    /* optionally force print every tick: */
-    REMOTE_TICK_ALWAYS_PRINT_STATUS = 0; /* 1 to always print */
-
-    SOCKET listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock == INVALID_SOCKET) {
-        printf("[SERVER] socket failed: %d\n", WSAGetLastError());
-        WSACleanup();
+    platform_socket_t listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock == (platform_socket_t)-1
+    #ifdef _WIN32
+        || listen_sock == INVALID_SOCKET
+    #endif
+    ) {
+        printf("[SERVER] socket failed: %d\n", platform_socket_last_error());
+        platform_socket_cleanup();
         return;
     }
 
     struct sockaddr_in serv;
     memset(&serv, 0, sizeof(serv));
-    serv.sin_family = AF_INET;
+    serv.sin_family = AF_INET;  // IPv4
     serv.sin_addr.s_addr = htonl(INADDR_ANY);
     serv.sin_port = htons((u_short)port);
 
@@ -327,24 +329,19 @@ void run_remote_server(Elevator elevators[], int elevator_count, int port) {
 
     printf("[SERVER] Listening on port %d...\n", port);
 
-    DWORD last_tick = GetTickCount();
-
     while (1) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(listen_sock, &readfds);
-        SOCKET maxfd = listen_sock;
+        fd_set readfds;                 // 要監聽的 socket 集合
+        FD_ZERO(&readfds);              // 清空
+        FD_SET(listen_sock, &readfds);  // 把監聽 socket 加入，監控是否有新連線
+        SOCKET maxfd = listen_sock;     // 最大 socket 值，供 select 使用
         for (int i = 0; i < client_count; ++i) {
             FD_SET(clients[i].sock, &readfds);
             if (clients[i].sock > maxfd) maxfd = clients[i].sock;
         }
 
-        DWORD now = GetTickCount();
-        int elapsed = (int)(now - last_tick);
-        int wait_ms = SIM_TICK_MS - (elapsed > 0 ? elapsed : 0);
-        if (wait_ms < 0) wait_ms = 0;
+        int wait_ms = SIM_TICK_MS;
 
-        struct timeval tv;
+        struct timeval tv;  // select 沉睡需要使用 timeval 為單位
         tv.tv_sec = wait_ms / 1000;
         tv.tv_usec = (wait_ms % 1000) * 1000;
 
@@ -354,22 +351,22 @@ void run_remote_server(Elevator elevators[], int elevator_count, int port) {
             break;
         }
 
-        if (FD_ISSET(listen_sock, &readfds)) {
+        if (FD_ISSET(listen_sock, &readfds)) {  // 有新連線
             accept_new_client(listen_sock);
         }
 
         /* handle client sockets */
         for (int i = 0; i < client_count; ++i) {
-            if (FD_ISSET(clients[i].sock, &readfds)) {
+            if (FD_ISSET(clients[i].sock, &readfds)) {  // client[i] 有資料可讀
                 char buf[512];
                 int len = recv(clients[i].sock, buf, sizeof(buf)-1, 0);
-                if (len <= 0) {
+                if (len <= 0) {  // 出錯或失效的 => 移除
                     remove_client(i);
                     i--;
                     continue;
                 }
                 buf[len] = '\0';
-                /* concatenate to inbuf (handle partial lines) */
+                // 把收到的字串附加到 clients[i].inbuf 上
                 if (clients[i].inbuf_len + len < (int)sizeof(clients[i].inbuf) - 1) {
                     memcpy(clients[i].inbuf + clients[i].inbuf_len, buf, len);
                     clients[i].inbuf_len += len;
@@ -380,32 +377,28 @@ void run_remote_server(Elevator elevators[], int elevator_count, int port) {
                     clients[i].inbuf[0] = '\0';
                 }
                 /* process full lines */
-                char* start = clients[i].inbuf;
-                char* eol;
-                while ((eol = strstr(start, "\r\n")) != NULL || (eol = strchr(start, '\n')) != NULL) {
+                char* start = clients[i].inbuf;  // 指向尚未處理的起點
+                char* eol;                       // 指向指令結尾
+                while ((eol = strstr(start, "\r\n")) != NULL || (eol = strchr(start, '\n')) != NULL) {  // 找指令結尾
                     size_t linelen = eol - start;
-                    char line[512];
+                    char line[512];  // 用於儲存指令
                     if (linelen >= sizeof(line)) linelen = sizeof(line)-1;
                     memcpy(line, start, linelen);
                     line[linelen] = '\0';
-                    handle_client_command(i, line, elevators, elevator_count);
-                    /* advance start past line ending */
+                    handle_client_command(i, line);
+                    // 處理完 => 起點指標移動至 "\r\n" 或 '\n' 後面 => 下個 while 繼續處理
                     if (*eol == '\r' && *(eol+1) == '\n') start = eol + 2;
                     else start = eol + 1;
                 }
-                /* move remaining partial data to front */
+                // while 處理完 => 將後面殘留的移到前面 => 繼續拼接
                 int rem = strlen(start);
                 memmove(clients[i].inbuf, start, rem);
                 clients[i].inbuf_len = rem;
                 clients[i].inbuf[rem] = '\0';
             }
         }
-
-        now = GetTickCount();
-        remote_tick_try_do(now);
     }
 
-    remote_tick_shutdown();
     closesocket(listen_sock);
     WSACleanup();
 }
