@@ -50,6 +50,9 @@ static int client_count = 0;
 static Elevator* g_elevators = NULL;
 static int g_elevator_count = 0;
 
+
+static DWORD g_last_broadcast_ms = 0;  // 上次廣播時間（毫秒）
+
 /* 發送字串 */
 static void send_line(SOCKET s, const char* line) {
     if (s == INVALID_SOCKET) return;
@@ -74,6 +77,17 @@ void broadcast_status_to_guards(Elevator elevators[], int elevator_count, int on
             send(clients[i].sock, big, (int)strlen(big), 0);
         }
     }
+}
+
+// 由 server_core 每個 tick 呼叫，把狀態推給所有 WATCH 的 GUARD
+static void on_core_status(const char* snapshot) {
+    (void)snapshot; // 我們不用 core 給的文字，改用既有的格式重算
+    printf("[REMOTE] on_core_status called.\n");
+
+    if (!g_elevators || g_elevator_count <= 0) return;
+
+    // 只把狀態推給有 WATCH 的 GUARD
+    broadcast_status_to_guards(g_elevators, g_elevator_count, 1);
 }
 
 /* 接受新用戶端連線 */
@@ -291,6 +305,8 @@ static void handle_client_command(int idx, const char* line) {
 void run_remote_server(int port) {
     g_elevators = server_core_get_elevators();
     g_elevator_count = server_core_get_elevator_count();
+    //server_core_set_status_callback(on_core_status);  // 狀態送給 WATCH 的警衛
+    g_last_broadcast_ms = GetTickCount(); // 初始化廣播時間
 
     if (platform_socket_init() != 0) {
         printf("[SERVER] platform_socket_init failed: %d\n", platform_socket_last_error());
@@ -396,6 +412,25 @@ void run_remote_server(int port) {
                 clients[i].inbuf_len = rem;
                 clients[i].inbuf[rem] = '\0';
             }
+        }
+
+        // 定時廣播給 WATCH 的 GUARD
+        DWORD now = GetTickCount();
+        if (now - g_last_broadcast_ms >= SIM_TICK_MS) {
+            // 檢查有沒有 watcher，沒人看就不廣播
+            int has_watcher = 0;
+            for (int i = 0; i < client_count; ++i) {
+                if (clients[i].type == CLIENT_GUARD && clients[i].watching) {
+                    has_watcher = 1;
+                    break;
+                }
+            }
+
+            if (has_watcher && g_elevators && g_elevator_count > 0) {
+                broadcast_status_to_guards(g_elevators, g_elevator_count, 1);
+            }
+
+            g_last_broadcast_ms = now;
         }
     }
 
